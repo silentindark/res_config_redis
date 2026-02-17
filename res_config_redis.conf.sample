@@ -1,0 +1,64 @@
+;
+; res_config_redis.conf - Redis RealTime Configuration Driver
+;
+; This module provides a realtime configuration engine backed by Redis.
+; It stores Asterisk configuration objects (such as PJSIP endpoints, AORs,
+; auths, and contacts) as Redis Hashes.
+;
+; Redis Data Model:
+;   {prefix}{table}:{id}        -> Redis HASH (one hash per row)
+;   {prefix}{table}:__index     -> Redis SET of all IDs in the table
+;
+; Example:
+;   ps_endpoints:1001           -> HASH { id=1001, transport=udp, context=from-internal, ... }
+;   ps_endpoints:__index        -> SET { 1001, 1002, 1003 }
+;
+
+[general]
+;
+; hostname - Redis server hostname or IP address
+; Default: 127.0.0.1
+;
+;hostname = 127.0.0.1
+
+;
+; port - Redis server port
+; Default: 6379
+;
+;port = 6379
+
+;
+; dbnum - Redis database number (0-15)
+; Default: 0
+;
+;dbnum = 0
+
+;
+; password - Redis AUTH password
+; For Redis 6+ with ACL, use together with 'username'.
+; For Redis < 6, set only the password.
+; Default: (empty, no authentication)
+;
+;password =
+
+;
+; username - Redis ACL username (Redis 6+)
+; If set, AUTH will use both username and password.
+; Default: (empty)
+;
+;username =
+
+;
+; timeout - Connection and command timeout in milliseconds
+; Minimum: 100
+; Default: 3000
+;
+;timeout = 3000
+
+;
+; prefix - Optional key prefix for all Redis keys
+; Useful for namespacing when sharing a Redis instance.
+; Example: prefix = ast: -> keys become "ast:ps_endpoints:1001"
+; Default: (empty, no prefix)
+;
+;prefix =
