@@ -60,10 +60,56 @@ static char password[256] = "";
 static char username[256] = "";
 static int timeout_ms = DEFAULT_TIMEOUT_MS;
 static char prefix[256] = "";
+static int debug_queries;
 
 static redisContext *redis_context;
 AST_MUTEX_DEFINE_STATIC(redis_lock);
 static time_t connect_time;
+
+/*! \brief Execute a Redis command with optional debug logging
+ * \param ctx The Redis context
+ * \param fmt printf-style format string (as used by redisCommand)
+ * \return redisReply pointer, or NULL on error (same as redisCommand)
+ *
+ * \note Must be called with redis_lock held (same requirement as redisCommand)
+ */
+static redisReply *redis_command(redisContext *ctx, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
+
+static redisReply *redis_command(redisContext *ctx, const char *fmt, ...)
+{
+	va_list ap;
+	redisReply *reply;
+
+	if (debug_queries) {
+		char buf[1024];
+		va_list ap_log;
+
+		va_start(ap_log, fmt);
+		vsnprintf(buf, sizeof(buf), fmt, ap_log);
+		va_end(ap_log);
+
+		/* Mask passwords in AUTH commands */
+		if (!strncasecmp(buf, "AUTH ", 5)) {
+			char *space = strchr(buf + 5, ' ');
+			if (space) {
+				/* AUTH user pass -> mask pass */
+				snprintf(space + 1, sizeof(buf) - (space + 1 - buf), "****");
+			} else {
+				/* AUTH pass -> mask pass */
+				snprintf(buf + 5, sizeof(buf) - 5, "****");
+			}
+		}
+
+		ast_verbose(VERBOSE_PREFIX_4 "Redis query: %s\n", buf);
+	}
+
+	va_start(ap, fmt);
+	reply = redisvCommand(ctx, fmt, ap);
+	va_end(ap);
+
+	return reply;
+}
 
 /*! \brief Build a Redis key from prefix, table, and id
  * \param buf Output buffer
@@ -98,7 +144,7 @@ static int redis_reconnect(void)
 
 	/* Check existing connection */
 	if (redis_context && redis_context->err == 0) {
-		reply = redisCommand(redis_context, "PING");
+		reply = redis_command(redis_context, "PING");
 		if (reply) {
 			if (reply->type == REDIS_REPLY_STATUS &&
 			    !strcasecmp(reply->str, "PONG")) {
@@ -138,9 +184,9 @@ static int redis_reconnect(void)
 	/* Authenticate if configured */
 	if (!ast_strlen_zero(password)) {
 		if (!ast_strlen_zero(username)) {
-			reply = redisCommand(redis_context, "AUTH %s %s", username, password);
+			reply = redis_command(redis_context, "AUTH %s %s", username, password);
 		} else {
-			reply = redisCommand(redis_context, "AUTH %s", password);
+			reply = redis_command(redis_context, "AUTH %s", password);
 		}
 
 		if (!reply || reply->type == REDIS_REPLY_ERROR) {
@@ -158,7 +204,7 @@ static int redis_reconnect(void)
 
 	/* Select database if non-default */
 	if (dbnum != 0) {
-		reply = redisCommand(redis_context, "SELECT %d", dbnum);
+		reply = redis_command(redis_context, "SELECT %d", dbnum);
 		if (!reply || reply->type == REDIS_REPLY_ERROR) {
 			ast_log(LOG_ERROR, "Redis: SELECT %d failed: %s\n",
 				dbnum, reply ? reply->str : "no reply");
@@ -400,7 +446,7 @@ static struct ast_variable *realtime_redis(const char *database,
 			return NULL;
 		}
 
-		reply = redisCommand(redis_context, "HGETALL %s", key);
+		reply = redis_command(redis_context, "HGETALL %s", key);
 		if (!reply) {
 			ast_log(LOG_ERROR, "Redis: HGETALL %s failed: %s\n",
 				key, redis_context->errstr);
@@ -428,7 +474,7 @@ static struct ast_variable *realtime_redis(const char *database,
 		return NULL;
 	}
 
-	index_reply = redisCommand(redis_context, "SMEMBERS %s", key);
+	index_reply = redis_command(redis_context, "SMEMBERS %s", key);
 	if (!index_reply || index_reply->type != REDIS_REPLY_ARRAY) {
 		if (index_reply) {
 			freeReplyObject(index_reply);
@@ -448,7 +494,7 @@ static struct ast_variable *realtime_redis(const char *database,
 			continue;
 		}
 
-		reply = redisCommand(redis_context, "HGETALL %s", key);
+		reply = redis_command(redis_context, "HGETALL %s", key);
 		if (!reply || reply->type != REDIS_REPLY_ARRAY || reply->elements == 0) {
 			if (reply) {
 				freeReplyObject(reply);
@@ -510,7 +556,7 @@ static struct ast_config *realtime_multi_redis(const char *database,
 		return NULL;
 	}
 
-	index_reply = redisCommand(redis_context, "SMEMBERS %s", key);
+	index_reply = redis_command(redis_context, "SMEMBERS %s", key);
 	if (!index_reply || index_reply->type != REDIS_REPLY_ARRAY) {
 		if (index_reply) {
 			freeReplyObject(index_reply);
@@ -532,7 +578,7 @@ static struct ast_config *realtime_multi_redis(const char *database,
 			continue;
 		}
 
-		reply = redisCommand(redis_context, "HGETALL %s", key);
+		reply = redis_command(redis_context, "HGETALL %s", key);
 		if (!reply || reply->type != REDIS_REPLY_ARRAY || reply->elements == 0) {
 			if (reply) {
 				freeReplyObject(reply);
@@ -612,7 +658,7 @@ static int store_redis(const char *database, const char *table,
 	}
 
 	/* Delete any existing key first to ensure clean state */
-	reply = redisCommand(redis_context, "DEL %s", key);
+	reply = redis_command(redis_context, "DEL %s", key);
 	if (reply) {
 		freeReplyObject(reply);
 	}
@@ -620,7 +666,7 @@ static int store_redis(const char *database, const char *table,
 	/* Store each field using individual HSET commands */
 	count = 0;
 	for (v = fields; v; v = v->next) {
-		reply = redisCommand(redis_context, "HSET %s %s %s",
+		reply = redis_command(redis_context, "HSET %s %s %s",
 			key, v->name, v->value);
 		if (!reply) {
 			ast_log(LOG_ERROR, "Redis: HSET %s %s failed: %s\n",
@@ -640,7 +686,7 @@ static int store_redis(const char *database, const char *table,
 	}
 
 	/* Add to the index set */
-	reply = redisCommand(redis_context, "SADD %s %s", index_key, id);
+	reply = redis_command(redis_context, "SADD %s %s", index_key, id);
 	if (!reply || reply->type == REDIS_REPLY_ERROR) {
 		ast_log(LOG_WARNING, "Redis: SADD %s %s failed: %s\n",
 			index_key, id,
@@ -687,7 +733,7 @@ static int destroy_redis(const char *database, const char *table,
 			return -1;
 		}
 
-		reply = redisCommand(redis_context, "DEL %s", key);
+		reply = redis_command(redis_context, "DEL %s", key);
 		if (!reply) {
 			ast_mutex_unlock(&redis_lock);
 			return -1;
@@ -698,7 +744,7 @@ static int destroy_redis(const char *database, const char *table,
 		freeReplyObject(reply);
 
 		/* Remove from index */
-		reply = redisCommand(redis_context, "SREM %s %s", index_key, entity);
+		reply = redis_command(redis_context, "SREM %s %s", index_key, entity);
 		if (reply) {
 			freeReplyObject(reply);
 		}
@@ -712,7 +758,7 @@ static int destroy_redis(const char *database, const char *table,
 		redisReply *index_reply;
 		size_t i;
 
-		index_reply = redisCommand(redis_context, "SMEMBERS %s", index_key);
+		index_reply = redis_command(redis_context, "SMEMBERS %s", index_key);
 		if (!index_reply || index_reply->type != REDIS_REPLY_ARRAY) {
 			if (index_reply) {
 				freeReplyObject(index_reply);
@@ -736,7 +782,7 @@ static int destroy_redis(const char *database, const char *table,
 				continue;
 			}
 
-			reply = redisCommand(redis_context, "HGETALL %s", key);
+			reply = redis_command(redis_context, "HGETALL %s", key);
 			if (!reply || reply->type != REDIS_REPLY_ARRAY || reply->elements == 0) {
 				if (reply) {
 					freeReplyObject(reply);
@@ -768,7 +814,7 @@ static int destroy_redis(const char *database, const char *table,
 			ast_variables_destroy(row_vars);
 
 			if (match) {
-				reply = redisCommand(redis_context, "DEL %s", key);
+				reply = redis_command(redis_context, "DEL %s", key);
 				if (reply) {
 					if (reply->type == REDIS_REPLY_INTEGER && reply->integer > 0) {
 						deleted++;
@@ -776,7 +822,7 @@ static int destroy_redis(const char *database, const char *table,
 					freeReplyObject(reply);
 				}
 
-				reply = redisCommand(redis_context, "SREM %s %s", index_key, row_id);
+				reply = redis_command(redis_context, "SREM %s %s", index_key, row_id);
 				if (reply) {
 					freeReplyObject(reply);
 				}
@@ -820,7 +866,7 @@ static int update_redis(const char *database, const char *table,
 		}
 
 		/* Verify the key exists */
-		reply = redisCommand(redis_context, "EXISTS %s", key);
+		reply = redis_command(redis_context, "EXISTS %s", key);
 		if (!reply) {
 			ast_mutex_unlock(&redis_lock);
 			return -1;
@@ -833,7 +879,7 @@ static int update_redis(const char *database, const char *table,
 		freeReplyObject(reply);
 
 		for (v = fields; v; v = v->next) {
-			reply = redisCommand(redis_context, "HSET %s %s %s",
+			reply = redis_command(redis_context, "HSET %s %s %s",
 				key, v->name, v->value);
 			if (!reply) {
 				ast_mutex_unlock(&redis_lock);
@@ -864,7 +910,7 @@ static int update_redis(const char *database, const char *table,
 			return -1;
 		}
 
-		index_reply = redisCommand(redis_context, "SMEMBERS %s", index_key);
+		index_reply = redis_command(redis_context, "SMEMBERS %s", index_key);
 		if (!index_reply || index_reply->type != REDIS_REPLY_ARRAY) {
 			if (index_reply) {
 				freeReplyObject(index_reply);
@@ -886,7 +932,7 @@ static int update_redis(const char *database, const char *table,
 				continue;
 			}
 
-			reply = redisCommand(redis_context, "HGETALL %s", key);
+			reply = redis_command(redis_context, "HGETALL %s", key);
 			if (!reply || reply->type != REDIS_REPLY_ARRAY ||
 			    reply->elements == 0) {
 				if (reply) {
@@ -906,7 +952,7 @@ static int update_redis(const char *database, const char *table,
 			if (val && !strcmp(val, entity)) {
 				/* Match found, apply updates */
 				for (v = fields; v; v = v->next) {
-					reply = redisCommand(redis_context,
+					reply = redis_command(redis_context,
 						"HSET %s %s %s",
 						key, v->name, v->value);
 					if (reply) {
@@ -958,7 +1004,7 @@ static int update2_redis(const char *database, const char *table,
 		}
 
 		/* Verify the key exists */
-		reply = redisCommand(redis_context, "EXISTS %s", key);
+		reply = redis_command(redis_context, "EXISTS %s", key);
 		if (!reply) {
 			ast_mutex_unlock(&redis_lock);
 			return -1;
@@ -971,7 +1017,7 @@ static int update2_redis(const char *database, const char *table,
 		freeReplyObject(reply);
 
 		for (v = update_fields; v; v = v->next) {
-			reply = redisCommand(redis_context, "HSET %s %s %s",
+			reply = redis_command(redis_context, "HSET %s %s %s",
 				key, v->name, v->value);
 			if (reply) {
 				freeReplyObject(reply);
@@ -988,7 +1034,7 @@ static int update2_redis(const char *database, const char *table,
 		return -1;
 	}
 
-	index_reply = redisCommand(redis_context, "SMEMBERS %s", index_key);
+	index_reply = redis_command(redis_context, "SMEMBERS %s", index_key);
 	if (!index_reply || index_reply->type != REDIS_REPLY_ARRAY) {
 		if (index_reply) {
 			freeReplyObject(index_reply);
@@ -1009,7 +1055,7 @@ static int update2_redis(const char *database, const char *table,
 			continue;
 		}
 
-		reply = redisCommand(redis_context, "HGETALL %s", key);
+		reply = redis_command(redis_context, "HGETALL %s", key);
 		if (!reply || reply->type != REDIS_REPLY_ARRAY ||
 		    reply->elements == 0) {
 			if (reply) {
@@ -1027,7 +1073,7 @@ static int update2_redis(const char *database, const char *table,
 
 		if (variables_match_fields(row_vars, lookup_fields)) {
 			for (v = update_fields; v; v = v->next) {
-				reply = redisCommand(redis_context,
+				reply = redis_command(redis_context,
 					"HSET %s %s %s",
 					key, v->name, v->value);
 				if (reply) {
@@ -1138,7 +1184,7 @@ static char *handle_cli_redis_show_status(struct ast_cli_entry *e,
 			ast_cli(a->fd, "  Username: %s\n", username);
 		}
 
-		reply = redisCommand(redis_context, "INFO server");
+		reply = redis_command(redis_context, "INFO server");
 		if (reply && reply->type == REDIS_REPLY_STRING) {
 			/* Extract redis_version from INFO output */
 			const char *ver = strstr(reply->str, "redis_version:");
@@ -1198,7 +1244,7 @@ static char *handle_cli_redis_show_records(struct ast_cli_entry *e,
 		return CLI_FAILURE;
 	}
 
-	index_reply = redisCommand(redis_context, "SMEMBERS %s", index_key);
+	index_reply = redis_command(redis_context, "SMEMBERS %s", index_key);
 	if (!index_reply || index_reply->type != REDIS_REPLY_ARRAY) {
 		ast_cli(a->fd, "Redis: No records found for table '%s'\n", table);
 		if (index_reply) {
@@ -1221,7 +1267,7 @@ static char *handle_cli_redis_show_records(struct ast_cli_entry *e,
 			continue;
 		}
 
-		reply = redisCommand(redis_context, "HGETALL %s", key);
+		reply = redis_command(redis_context, "HGETALL %s", key);
 		if (!reply || reply->type != REDIS_REPLY_ARRAY ||
 		    reply->elements == 0) {
 			if (reply) {
@@ -1254,9 +1300,41 @@ static char *handle_cli_redis_show_records(struct ast_cli_entry *e,
 	return CLI_SUCCESS;
 }
 
+static char *handle_cli_redis_set_debug(struct ast_cli_entry *e,
+	int cmd, struct ast_cli_args *a)
+{
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "redis set debug {on|off}";
+		e->usage =
+			"Usage: redis set debug {on|off}\n"
+			"       Enable or disable logging of Redis queries.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != 4) {
+		return CLI_SHOWUSAGE;
+	}
+
+	if (!strcasecmp(a->argv[3], "on")) {
+		debug_queries = 1;
+		ast_cli(a->fd, "Redis query debugging enabled\n");
+	} else if (!strcasecmp(a->argv[3], "off")) {
+		debug_queries = 0;
+		ast_cli(a->fd, "Redis query debugging disabled\n");
+	} else {
+		return CLI_SHOWUSAGE;
+	}
+
+	return CLI_SUCCESS;
+}
+
 static struct ast_cli_entry cli_realtime_redis[] = {
 	AST_CLI_DEFINE(handle_cli_redis_show_status, "Show Redis connection status"),
 	AST_CLI_DEFINE(handle_cli_redis_show_records, "Show all records for a Redis table"),
+	AST_CLI_DEFINE(handle_cli_redis_set_debug, "Enable or disable Redis query debugging"),
 };
 
 /*
@@ -1345,6 +1423,9 @@ static int parse_config(int reload)
 	} else {
 		prefix[0] = '\0';
 	}
+
+	val = ast_variable_retrieve(cfg, "general", "debug");
+	debug_queries = (!ast_strlen_zero(val) && ast_true(val)) ? 1 : 0;
 
 	/* Force reconnect on config change */
 	if (redis_context) {

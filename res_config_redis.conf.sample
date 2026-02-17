@@ -62,3 +62,12 @@
 ; Default: (empty, no prefix)
 ;
 ;prefix =
+
+;
+; debug - Log every Redis command to the Asterisk verbose output
+; Useful for debugging realtime queries. View with:
+;   core set verbose 4
+; or add "verbose = 4" to logger.conf for a log file.
+; Default: no
+;
+;debug = no
